@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="ProjectModuleManager">
+    <modules>
+      <module fileurl="file://$PROJECT_DIR$/consumer/consumer-module/consumer-module.iml" filepath="$PROJECT_DIR$/consumer/consumer-module/consumer-module.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/meteo-utb.iml" filepath="$PROJECT_DIR$/.idea/meteo-utb.iml" />
+      <module fileurl="file://$PROJECT_DIR$/producer/producer-module/producer-module.iml" filepath="$PROJECT_DIR$/producer/producer-module/producer-module.iml" />
+    </modules>
+  </component>
+</project>

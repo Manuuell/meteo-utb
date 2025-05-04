@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<module type="JAVA_MODULE" version="4">
+  <component name="FacetManager">
+    <facet type="Python" name="Python facet">
+      <configuration sdkName="Python 3.13 virtualenv at C:\Users\MANUEL\WebstormProjects\FluidoLab\venv" />
+    </facet>
+  </component>
+  <component name="NewModuleRootManager" inherit-compiler-output="true">
+    <exclude-output />
+    <content url="file://$MODULE_DIR$" />
+    <orderEntry type="jdk" jdkName="Python 3.13 virtualenv at C:\Users\MANUEL\IdeaProjects\meteo-utb\producer\venv" jdkType="Python SDK" />
+    <orderEntry type="sourceFolder" forTests="false" />
+    <orderEntry type="library" name="Python 3.13 virtualenv at C:\Users\MANUEL\WebstormProjects\FluidoLab\venv interpreter library" level="application" />
+  </component>
+</module>
