@@ -1,6 +1,3 @@
-# docker-compose.yml
-version: "3.9"
-
 services:
   rabbitmq:
     image: rabbitmq:3-management
@@ -13,6 +10,11 @@ services:
     environment:
       RABBITMQ_DEFAULT_USER: user
       RABBITMQ_DEFAULT_PASS: pass
+    healthcheck:
+      test: ["CMD", "rabbitmqctl", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   postgres:
     image: postgres:15
@@ -25,6 +27,11 @@ services:
       POSTGRES_DB: weather
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: admin
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   producer:
     build:
@@ -33,7 +40,8 @@ services:
     container_name: producer
     restart: always
     depends_on:
-      - rabbitmq
+      rabbitmq:
+        condition: service_healthy
     env_file:
       - .env
     command: ["python", "producer.py"]
@@ -45,8 +53,10 @@ services:
     container_name: consumer
     restart: always
     depends_on:
-      - rabbitmq
-      - postgres
+      rabbitmq:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
     env_file:
       - .env
     command: ["python", "consumer.py"]
