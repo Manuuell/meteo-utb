@@ -1,98 +1,143 @@
 #!/usr/bin/env python3
+"""
+consumer.py
+
+Microservicio consumidor para el sistema de logs meteorológicos.
+
+- Se conecta a RabbitMQ usando credenciales de .env
+- Se conecta a PostgreSQL, reintentando hasta 30s
+- Procesa mensajes JSON de estaciones: valida temperatura, humedad y viento
+- Persiste en la tabla weather_logs con marca de tiempo de recepción
+- Usa ack/nack manual para garantizar delivery EXACTLY-ONCE
+- Configurado con prefetch_count=1 para orden e integridad
+"""
+
 import os
+import sys
 import time
 import json
+import logging
 
 import pika
 import psycopg2
-from psycopg2 import sql
+from psycopg2 import sql, OperationalError
 from dotenv import load_dotenv
 
-# 1️⃣ Carga el .env que está en la raíz del proyecto
-#    Asegúrate de lanzar el contenedor con `env_file: - .env`
-here = os.path.dirname(__file__)
-load_dotenv(os.path.join(here, '..', '.env'))
+# ─── Configuración de logging ────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)-8s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+logger = logging.getLogger(__name__)
 
-# 2️⃣ Lee todas las variables de entorno
-RABBITMQ_HOST = os.getenv('RABBITMQ_HOST', 'rabbitmq')
-RABBITMQ_USER = os.getenv('RABBITMQ_USER', 'user')
-RABBITMQ_PASS = os.getenv('RABBITMQ_PASS', 'pass')
-RABBITMQ_QUEUE = os.getenv('RABBITMQ_QUEUE', 'weather_data')
+# ─── Carga de variables de entorno ────────────────────────────────────────────
+BASE_DIR = os.path.dirname(__file__)
+load_dotenv(os.path.join(BASE_DIR, "..", ".env"))
+
+RABBITMQ_HOST  = os.getenv("RABBITMQ_HOST",  "rabbitmq")
+RABBITMQ_USER  = os.getenv("RABBITMQ_USER",  "user")
+RABBITMQ_PASS  = os.getenv("RABBITMQ_PASS",  "pass")
+RABBITMQ_QUEUE = os.getenv("RABBITMQ_QUEUE", "weather_data")
 
 DB_CONFIG = {
-    'dbname':   os.getenv('POSTGRES_DB',       'weather'),
-    'user':     os.getenv('POSTGRES_USER',     'postgres'),
-    'password': os.getenv('POSTGRES_PASSWORD', 'admin'),
-    'host':     os.getenv('POSTGRES_HOST',     'postgres'),
-    'port':     os.getenv('POSTGRES_PORT',     '5432'),
+    "dbname":   os.getenv("POSTGRES_DB",       "weather"),
+    "user":     os.getenv("POSTGRES_USER",     "postgres"),
+    "password": os.getenv("POSTGRES_PASSWORD", "admin"),
+    "host":     os.getenv("POSTGRES_HOST",     "postgres"),
+    "port":     os.getenv("POSTGRES_PORT",     "5432"),
 }
 
-# 3️⃣ Espera a que Postgres esté listo (hasta 30s)
-print("⏳ Esperando a que PostgreSQL responda...")
-for i in range(15):
+
+def wait_for_postgres(max_retries: int = 15, delay: int = 2):
+    """
+    Intenta conectar a Postgres hasta max_retries veces.
+    Sale del programa si no logra conectarse.
+    """
+    for attempt in range(1, max_retries + 1):
+        try:
+            conn = psycopg2.connect(**DB_CONFIG)
+            conn.autocommit = False
+            logger.info("✅ Conectado a PostgreSQL")
+            return conn
+        except OperationalError:
+            logger.warning(f"Postgres no disponible, reintentando en {delay}s… ({attempt}/{max_retries})")
+            time.sleep(delay)
+    logger.critical("❌ No fue posible conectar a PostgreSQL. Abortando.")
+    sys.exit(1)
+
+
+def main():
+    # ─── Inicialización de PostgreSQL ──────────────────────────────
+    conn = wait_for_postgres()
+    cursor = conn.cursor()
+
+    # ─── Inicialización de RabbitMQ ────────────────────────────────
+    credentials = pika.PlainCredentials(RABBITMQ_USER, RABBITMQ_PASS)
+    params = pika.ConnectionParameters(host=RABBITMQ_HOST, credentials=credentials)
+    logger.info(f"🔌 Conectando a RabbitMQ en {RABBITMQ_HOST}:5672 …")
     try:
-        conn = psycopg2.connect(**DB_CONFIG)
-        cursor = conn.cursor()
-        print("✅ Conectado a PostgreSQL")
-        break
-    except psycopg2.OperationalError:
-        print(f"   Postgres no disponible, reintentando en 2s… ({i+1}/15)")
-        time.sleep(2)
-else:
-    print("❌ No fue posible conectar a PostgreSQL. Saliendo.")
-    exit(1)
+        connection = pika.BlockingConnection(params)
+    except pika.exceptions.AMQPConnectionError as e:
+        logger.critical(f"❌ No se pudo conectar a RabbitMQ: {e}")
+        sys.exit(1)
 
-# 4️⃣ Conexión a RabbitMQ con credenciales y host dinámico
-credentials = pika.PlainCredentials(RABBITMQ_USER, RABBITMQ_PASS)
-rabbit_params = pika.ConnectionParameters(host=RABBITMQ_HOST,
-                                          credentials=credentials)
-print(f"🔌 Conectando a RabbitMQ en {RABBITMQ_HOST}:5672 …")
-connection = pika.BlockingConnection(rabbit_params)
-channel = connection.channel()
-channel.queue_declare(queue=RABBITMQ_QUEUE, durable=True)
+    channel = connection.channel()
+    channel.queue_declare(queue=RABBITMQ_QUEUE, durable=True)
 
-# 5️⃣ Función callback para procesar cada mensaje
-def callback(ch, method, properties, body):
-    try:
-        data = json.loads(body)
-        print(f"📥 Recibido: {data}")
+    # ─── Callback para cada mensaje ────────────────────────────────
+    def callback(ch, method, properties, body):
+        try:
+            data = json.loads(body)
+            logger.info(f"📥 Recibido: {data}")
 
-        # validación de temperatura
-        temp = data.get("temperature")
-        if temp is None or not (-50 <= temp <= 100):
-            print("⚠️ Temperatura fuera de rango o ausente; descartando.")
-            ch.basic_ack(delivery_tag=method.delivery_tag)
-            return
+            # Validaciones de rango
+            temp = data.get("temperature")
+            if temp is None or not (-50 <= temp <= 100):
+                logger.warning("⚠️ Temperatura fuera de rango o ausente; descartando.")
+                ch.basic_ack(delivery_tag=method.delivery_tag)
+                return
 
-        # inserción con psycopg2 y psycopg2.sql
-        cursor.execute(
-            sql.SQL("""
-                INSERT INTO weather_logs
-                  (station_id, temperature, humidity, wind_speed, timestamp, received_at)
-                VALUES (%s, %s, %s, %s, %s, NOW())
-            """),
-            (
-                data["station_id"],
-                temp,
-                data.get("humidity"),
-                data.get("wind_speed"),
-                data.get("timestamp")
+            humidity = data.get("humidity")
+            wind_speed = data.get("wind_speed")
+            ts = data.get("timestamp")
+
+            # Inserción segura
+            cursor.execute(
+                sql.SQL("""
+                    INSERT INTO weather_logs
+                      (station_id, temperature, humidity, wind_speed, timestamp, received_at)
+                    VALUES (%s, %s, %s, %s, %s, NOW())
+                """),
+                (data["station_id"], temp, humidity, wind_speed, ts)
             )
-        )
-        conn.commit()
-        print("✅ Guardado en weather_logs")
+            conn.commit()
+            logger.info("✅ Guardado en weather_logs")
 
-        # ack manual
-        ch.basic_ack(delivery_tag=method.delivery_tag)
+            ch.basic_ack(delivery_tag=method.delivery_tag)
 
-    except Exception as e:
-        print(f"❌ Error al procesar mensaje: {e}")
-        # en caso de error, se rechaza el mensaje (sin requeue):
-        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+        except Exception as exc:
+            logger.error(f"❌ Error procesando mensaje: {exc}", exc_info=True)
+            conn.rollback()
+            # rechaza sin requeue para no bloquear la cola con mensajes malos
+            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
 
-# 6️⃣ Prefetch=1 y comienzo de consumo
-channel.basic_qos(prefetch_count=1)
-channel.basic_consume(queue=RABBITMQ_QUEUE, on_message_callback=callback)
+    # ─── Consumo de mensajes ────────────────────────────────────────
+    channel.basic_qos(prefetch_count=1)
+    channel.basic_consume(queue=RABBITMQ_QUEUE, on_message_callback=callback)
+    logger.info("🟢 [*] Esperando mensajes. Para salir: CTRL+C")
 
-print("🟢 [*] Esperando mensajes. Para salir: CTRL+C")
-channel.start_consuming()
+    try:
+        channel.start_consuming()
+    except KeyboardInterrupt:
+        logger.info("🛑 Interrumpido por el usuario, cerrando conexiones…")
+    finally:
+        channel.close()
+        connection.close()
+        cursor.close()
+        conn.close()
+        logger.info("✅ Todas las conexiones se han cerrado cleanly.")
+
+
+if __name__ == "__main__":
+    main()

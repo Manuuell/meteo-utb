@@ -1,71 +1,109 @@
 #!/usr/bin/env python3
+"""
+Producer de datos meteorológicos.
+
+Este script:
+  1) Carga configuración desde .env
+  2) Se reconecta a RabbitMQ con reintentos
+  3) Genera y publica datos JSON cada intervalo
+  4) Marca los mensajes como persistentes
+"""
+
 import os
-import json
+import sys
 import time
+import json
 import random
+import logging
+
 import pika
 from dotenv import load_dotenv
 
-# ————————————————
-# Carga el .env que está una carpeta arriba
-# ————————————————
-here = os.path.dirname(__file__)
-dotenv_path = os.path.join(here, '..', '.env')
+# ─── LOGGING ────────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)-8s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stdout
+)
+log = logging.getLogger(__name__)
+
+# ─── CARGA DE ENV ───────────────────────────────────────────────────────────────
+HERE = os.path.dirname(__file__)
+dotenv_path = os.path.join(HERE, "..", ".env")
 load_dotenv(dotenv_path)
 
-# ————————————————
-# Variables de entorno
-# ————————————————
-RABBITMQ_HOST  = os.getenv('RABBITMQ_HOST', 'localhost')
-RABBITMQ_USER  = os.getenv('RABBITMQ_USER', 'guest')
-RABBITMQ_PASS  = os.getenv('RABBITMQ_PASS', 'guest')
-RABBITMQ_QUEUE = os.getenv('RABBITMQ_QUEUE', 'weather_data')
+RABBITMQ_HOST  = os.getenv("RABBITMQ_HOST",  "rabbitmq")
+RABBITMQ_USER  = os.getenv("RABBITMQ_USER",  "user")
+RABBITMQ_PASS  = os.getenv("RABBITMQ_PASS",  "pass")
+RABBITMQ_QUEUE = os.getenv("RABBITMQ_QUEUE", "weather_data")
 
-# ————————————————
-# Conexión a RabbitMQ
-# ————————————————
-credentials = pika.PlainCredentials(RABBITMQ_USER, RABBITMQ_PASS)
-parameters  = pika.ConnectionParameters(host=RABBITMQ_HOST, credentials=credentials)
-connection  = pika.BlockingConnection(parameters)
-channel     = connection.channel()
+# ─── ESTACIONES SIMULADAS ───────────────────────────────────────────────────────
+STATIONS = ["S1", "S2", "S3", "S4"]
 
-# Cola durable para evitar pérdida de mensajes
-channel.queue_declare(queue=RABBITMQ_QUEUE, durable=True)
-
-# ————————————————
-# Datos simulados
-# ————————————————
-STATIONS = ['S1', 'S2', 'S3', 'S4']
-
-def generar_dato():
+def generar_dato() -> dict:
+    """Genera un diccionario con datos de estación meteorológica simulados."""
     return {
-        'station_id': random.choice(STATIONS),
-        'temperature': round(random.uniform(-20, 50), 2),  # °C
-        'humidity':    round(random.uniform(0, 100), 2),   # %
-        'wind_speed':  round(random.uniform(0, 30), 2),    # m/s
-        'timestamp':   time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+        "station_id": random.choice(STATIONS),
+        "temperature": round(random.uniform(-20, 50), 2),
+        "humidity":    round(random.uniform(0, 100), 2),
+        "wind_speed":  round(random.uniform(0, 30), 2),
+        "timestamp":   time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
 
-# ————————————————
-# Loop principal
-# ————————————————
-try:
-    print(f'▶️  Producer arrancado. Publicando en {RABBITMQ_HOST}:{RABBITMQ_QUEUE}')
-    while True:
-        dato = generar_dato()
-        mensaje = json.dumps(dato)
-        channel.basic_publish(
-            exchange='',
-            routing_key=RABBITMQ_QUEUE,
-            body=mensaje,
-            properties=pika.BasicProperties(delivery_mode=2)  # marca como persistent
-        )
-        print(f'📤 Enviado: {mensaje}')
-        time.sleep(5)
+def connect_rabbitmq(
+    retries: int = 5,
+    delay: float = 2.0
+) -> pika.BlockingConnection:
+    """
+    Establece conexión con RabbitMQ, reintentando en caso de fallo.
+    Sale con sys.exit(1) tras 'retries' intentos fallidos.
+    """
+    credentials = pika.PlainCredentials(RABBITMQ_USER, RABBITMQ_PASS)
+    params = pika.ConnectionParameters(host=RABBITMQ_HOST, credentials=credentials)
+    for attempt in range(1, retries + 1):
+        try:
+            conn = pika.BlockingConnection(params)
+            log.info("✅ Conectado a RabbitMQ %s:5672", RABBITMQ_HOST)
+            return conn
+        except pika.exceptions.AMQPConnectionError:
+            log.warning(
+                "RabbitMQ no disponible (%d/%d). Reintentando en %.0f s…",
+                attempt, retries, delay
+            )
+            time.sleep(delay)
 
-except KeyboardInterrupt:
-    print('\n⏹ Producer detenido por el usuario')
+    log.critical("❌ No se pudo conectar a RabbitMQ tras %d intentos.", retries)
+    sys.exit(1)
 
-finally:
-    connection.close()
-    print('🔌 Conexión cerrada')
+def main(interval: float = 5.0):
+    """Loop principal: genera y publica datos cada `interval` segundos."""
+    conn = connect_rabbitmq()
+    channel = conn.channel()
+    channel.queue_declare(queue=RABBITMQ_QUEUE, durable=True)
+
+    log.info("▶️  Producer arrancado. Publicando en '%s'", RABBITMQ_QUEUE)
+    try:
+        while True:
+            dato = generar_dato()
+            msg = json.dumps(dato)
+
+            channel.basic_publish(
+                exchange="",
+                routing_key=RABBITMQ_QUEUE,
+                body=msg,
+                properties=pika.BasicProperties(delivery_mode=2)
+            )
+            log.info("📤 Enviado: %s", msg)
+            time.sleep(interval)
+
+    except KeyboardInterrupt:
+        log.info("⏹ Producer detenido por usuario (CTRL+C)")
+
+    finally:
+        if conn.is_open:
+            conn.close()
+            log.info("🔌 Conexión RabbitMQ cerrada")
+
+if __name__ == "__main__":
+    main()
