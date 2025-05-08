@@ -82,9 +82,9 @@ Permite simular y procesar datos JSON de estaciones (temperatura, humedad, veloc
 
 ```
 meteo-utb/
-├── .env                 # Var. entorno
+├── .env                 
 ├── db/
-│   └── init.sql         # Script creación de tabla
+│   └── init.sql  
 ├── producer/
 │   ├── Dockerfile
 │   ├── producer.py
